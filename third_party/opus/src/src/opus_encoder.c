@@ -29,6 +29,7 @@
 #include "config.h"
 #endif
 
+#include <stdio.h>
 #include <stdarg.h>
 #include "celt.h"
 #include "entenc.h"
@@ -87,6 +88,7 @@ struct OpusEncoder {
     int          lfe;
     int          arch;
     int          use_dtx;                 /* general DTX for both SILK and CELT */
+    int          fec_config;
 #ifndef DISABLE_FLOAT_API
     TonalityAnalysisState analysis;
 #endif
@@ -218,12 +220,12 @@ int opus_encoder_init(OpusEncoder* st, opus_int32 Fs, int channels, int applicat
     st->silk_mode.maxInternalSampleRate     = 16000;
     st->silk_mode.minInternalSampleRate     = 8000;
     st->silk_mode.desiredInternalSampleRate = 16000;
-    st->silk_mode.payloadSize_ms            = 20;
-    st->silk_mode.bitRate                   = 25000;
+    st->silk_mode.payloadSize_ms            = 10;
+    st->silk_mode.bitRate                   = 16000;
     st->silk_mode.packetLossPercentage      = 0;
-    st->silk_mode.complexity                = 9;
+    st->silk_mode.complexity                = 4;
     st->silk_mode.useInBandFEC              = 0;
-    st->silk_mode.useDTX                    = 0;
+    st->silk_mode.useDTX                    = 1;
     st->silk_mode.useCBR                    = 0;
     st->silk_mode.reducedDependency         = 0;
 
@@ -240,16 +242,16 @@ int opus_encoder_init(OpusEncoder* st, opus_int32 Fs, int channels, int applicat
     st->vbr_constraint = 1;
     st->user_bitrate_bps = OPUS_AUTO;
     st->bitrate_bps = 3000+Fs*channels;
-    st->application = application;
+    st->application = OPUS_APPLICATION_VOIP;//application;
     st->signal_type = OPUS_AUTO;
-    st->user_bandwidth = OPUS_AUTO;
+    st->user_bandwidth = OPUS_BANDWIDTH_WIDEBAND;
     st->max_bandwidth = OPUS_BANDWIDTH_FULLBAND;
-    st->force_channels = OPUS_AUTO;
-    st->user_forced_mode = OPUS_AUTO;
+    st->force_channels = 1;
+    st->user_forced_mode = MODE_CELT_ONLY;
     st->voice_ratio = -1;
     st->encoder_buffer = st->Fs/100;
     st->lsb_depth = 24;
-    st->variable_duration = OPUS_FRAMESIZE_ARG;
+    st->variable_duration = OPUS_FRAMESIZE_10_MS;
 
     /* Delay compensation of 4 ms (2.5 ms for SILK's extra look-ahead
        + 1.5 ms for SILK resamplers and stereo prediction) */
@@ -259,8 +261,8 @@ int opus_encoder_init(OpusEncoder* st, opus_int32 Fs, int channels, int applicat
     st->prev_HB_gain = Q15ONE;
     st->variable_HP_smth2_Q15 = silk_LSHIFT( silk_lin2log( VARIABLE_HP_MIN_CUTOFF_HZ ), 8 );
     st->first = 1;
-    st->mode = MODE_HYBRID;
-    st->bandwidth = OPUS_BANDWIDTH_FULLBAND;
+    st->mode = MODE_CELT_ONLY;
+    st->bandwidth = OPUS_BANDWIDTH_WIDEBAND;
 
 #ifndef DISABLE_FLOAT_API
     tonality_analysis_init(&st->analysis, st->Fs);
@@ -610,6 +612,7 @@ void downmix_int(const void *_x, opus_val32 *y, int subframe, int offset, int c1
 
 opus_int32 frame_size_select(opus_int32 frame_size, int variable_duration, opus_int32 Fs)
 {
+   
    int new_size;
    if (frame_size<Fs/400)
       return -1;
@@ -1122,9 +1125,9 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
 #ifndef DISABLE_FLOAT_API
     analysis_info.valid = 0;
 #ifdef FIXED_POINT
-    if (st->silk_mode.complexity >= 10 && st->Fs>=16000)
+    if (st->silk_mode.complexity >= 4 && st->Fs>=16000)
 #else
-    if (st->silk_mode.complexity >= 7 && st->Fs>=16000)
+    if (st->silk_mode.complexity >= 4 && st->Fs>=16000)
 #endif
     {
        is_silence = is_digital_silence(pcm, frame_size, st->channels, lsb_depth);
@@ -1314,6 +1317,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
         st->stream_channels = st->force_channels;
     } else {
 #ifdef FUZZING
+        (void)stereo_music_threshold;
+        (void)stereo_voice_threshold;
        /* Random mono/stereo decision */
        if (st->channels == 2 && (rand()&0x1F)==0)
           st->stream_channels = 3-st->stream_channels;
@@ -1352,6 +1357,8 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
     } else if (st->user_forced_mode == OPUS_AUTO)
     {
 #ifdef FUZZING
+        (void)stereo_width;
+        (void)mode_thresholds;
        /* Random mode switching */
        if ((rand()&0xF)==0)
        {
@@ -1389,8 +1396,9 @@ opus_int32 opus_encode_native(OpusEncoder *st, const opus_val16 *pcm, int frame_
 
        st->mode = (equiv_rate >= threshold) ? MODE_CELT_ONLY: MODE_SILK_ONLY;
 
-       /* When FEC is enabled and there's enough packet loss, use SILK */
-       if (st->silk_mode.useInBandFEC && st->silk_mode.packetLossPercentage > (128-voice_est)>>4)
+       /* When FEC is enabled and there's enough packet loss, use SILK.
+          Unless the FEC is set to 2, in which case we don't switch to SILK if we're confident we have music. */
+       if (st->silk_mode.useInBandFEC && st->silk_mode.packetLossPercentage > (128-voice_est)>>4 && (st->fec_config != 2 || voice_est > 25))
           st->mode = MODE_SILK_ONLY;
        /* When encoding voice and DTX is enabled but the generalized DTX cannot be used,
           use SILK in order to make use of its DTX. */
@@ -2218,6 +2226,7 @@ opus_int32 opus_encode(OpusEncoder *st, const opus_int16 *pcm, int analysis_fram
 {
    int frame_size;
    frame_size = frame_size_select(analysis_frame_size, st->variable_duration, st->Fs);
+   printf("\n--BALA :: frame_size_select frame_size  = %d and new_size = %d \n", analysis_frame_size, frame_size);
    return opus_encode_native(st, pcm, frame_size, data, out_data_bytes, 16,
                              pcm, analysis_frame_size, 0, -2, st->channels, downmix_int, 0);
 }
@@ -2439,11 +2448,12 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
         case OPUS_SET_INBAND_FEC_REQUEST:
         {
             opus_int32 value = va_arg(ap, opus_int32);
-            if(value<0 || value>1)
+            if(value<0 || value>2)
             {
                goto bad_arg;
             }
-            st->silk_mode.useInBandFEC = value;
+            st->fec_config = value;
+            st->silk_mode.useInBandFEC = (value != 0);
         }
         break;
         case OPUS_GET_INBAND_FEC_REQUEST:
@@ -2453,7 +2463,7 @@ int opus_encoder_ctl(OpusEncoder *st, int request, ...)
             {
                goto bad_arg;
             }
-            *value = st->silk_mode.useInBandFEC;
+            *value = st->fec_config;
         }
         break;
         case OPUS_SET_PACKET_LOSS_PERC_REQUEST:
